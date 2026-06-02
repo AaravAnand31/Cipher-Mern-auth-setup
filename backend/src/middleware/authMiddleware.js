@@ -4,23 +4,24 @@ const authMiddleware = (req, res, next) => {
 
     try {
 
-        // get token from headers
-        const token = req.header("Authorization");
+        const authHeader = req.header("Authorization");
 
-        // check token
-        if (!token) {
+        if (!authHeader) {
             return res.status(401).json({
                 message: "No token, access denied",
             });
         }
 
-        // verify token
+        // FIX: strip "Bearer " prefix sent by the frontend
+        const token = authHeader.startsWith("Bearer ")
+            ? authHeader.slice(7)
+            : authHeader;
+
         const verified = jwt.verify(
             token,
             process.env.JWT_SECRET
         );
 
-        // save user id in request
         req.user = verified.id;
 
         next();
