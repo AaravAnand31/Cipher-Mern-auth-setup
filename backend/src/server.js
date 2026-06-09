@@ -8,10 +8,10 @@ const jwt      = require("jsonwebtoken");
 const http     = require("http");
 const { Server } = require("socket.io");
 
-console.log("Starting server...");
+console.log("Starting Cipher server...");
 
 /* ════════════════════════════════════════════════
-   MODELS  (all inline — no separate files needed)
+   MODELS
 ════════════════════════════════════════════════ */
 
 const User = mongoose.model("User", new mongoose.Schema({
@@ -25,9 +25,11 @@ const User = mongoose.model("User", new mongoose.Schema({
     interests:   { type: [String], default: [] },
     lookingFor:  { type: [String], default: [] },
     openTo:      { type: [String], default: ["Everyone"] },
-    photoURL:    { type: String,   default: "" },   // stored as base64
-    coverURL:    { type: String,   default: "" },   // stored as base64
+    photoURL:    { type: String,   default: "" },
+    coverURL:    { type: String,   default: "" },
     profileDone: { type: Boolean,  default: false },
+    // ── NEW: lastSeen for "Last seen X ago" feature ──
+    lastSeen:    { type: Date,     default: null },
 }, { timestamps: true }));
 
 const connSchema = new mongoose.Schema({
@@ -38,11 +40,17 @@ const connSchema = new mongoose.Schema({
 connSchema.index({ fromUser: 1, toUser: 1 }, { unique: true });
 const Connection = mongoose.model("Connection", connSchema);
 
-const Message = mongoose.model("Message", new mongoose.Schema({
+const msgSchema = new mongoose.Schema({
     connectionId: { type: mongoose.Schema.Types.ObjectId, ref: "Connection", required: true },
-    senderUser:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    senderUser:   { type: mongoose.Schema.Types.ObjectId, ref: "User",       required: true },
     text:         { type: String, required: true },
-}, { timestamps: true }));
+    // ── NEW: soft-delete ──
+    isDeleted:    { type: Boolean, default: false },
+    // ── NEW: read receipts ──
+    seen:         { type: Boolean, default: false },
+    seenAt:       { type: Date,    default: null },
+}, { timestamps: true });
+const Message = mongoose.model("Message", msgSchema);
 
 
 /* ════════════════════════════════════════════════
@@ -69,7 +77,14 @@ const httpServer = http.createServer(app);
 const io         = new Server(httpServer, { cors: { origin: "*" } });
 
 app.use(cors());
-app.use(express.json({ limit: "15mb" }));   // 15mb for base64 photos
+app.use(express.json({ limit: "15mb" }));
+
+
+/* ════════════════════════════════════════════════
+   ONLINE USERS MAP  (userId → socketId)
+   Used for online/offline status & lastSeen
+════════════════════════════════════════════════ */
+const onlineUsers = new Map();  // Map<userId:string, socketId:string>
 
 
 /* ════════════════════════════════════════════════
@@ -109,7 +124,7 @@ app.get("/api/auth/me", auth, async (req, res) => {
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
-// Update profile  ← THIS was the missing route causing Issue 4
+// Update profile
 app.put("/api/auth/profile", auth, async (req, res) => {
     try {
         const fields = ["username","year","department","bio","icebreaker",
@@ -128,7 +143,7 @@ app.put("/api/auth/profile", auth, async (req, res) => {
    USER ROUTES  /api/users/...
 ════════════════════════════════════════════════ */
 
-// Discover — exclude self + already connected
+// Discover
 app.get("/api/users/discover", auth, async (req, res) => {
     try {
         const me    = req.user;
@@ -144,7 +159,13 @@ app.get("/api/users/discover", auth, async (req, res) => {
             .select("-password")
             .limit(limit).skip(skip).lean();
 
-        res.status(200).json(users);
+        // Attach online status
+        const result = users.map(u => ({
+            ...u,
+            isOnline: onlineUsers.has(u._id.toString()),
+        }));
+
+        res.status(200).json(result);
     } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
 
@@ -160,7 +181,11 @@ app.get("/api/users", auth, async (req, res) => {
             { interests:  { $elemMatch: { $regex: s, $options: "i" } } },
         ];
         const users = await User.find(filter).select("-password").limit(20).lean();
-        res.status(200).json(users);
+        const result = users.map(u => ({
+            ...u,
+            isOnline: onlineUsers.has(u._id.toString()),
+        }));
+        res.status(200).json(result);
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -169,7 +194,10 @@ app.get("/api/users/:id", auth, async (req, res) => {
     try {
         const user = await User.findById(req.params.id).select("-password").lean();
         if (!user) return res.status(404).json({ message: "Not found" });
-        res.status(200).json(user);
+        res.status(200).json({
+            ...user,
+            isOnline: onlineUsers.has(user._id.toString()),
+        });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -227,7 +255,7 @@ app.get("/api/connections/requests", auth, async (req, res) => {
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
-// All my accepted connections (for chat list)
+// ── FIX #1 + FEATURE #2: All accepted connections WITH count + online status ──
 app.get("/api/connections", auth, async (req, res) => {
     try {
         const conns = await Connection.find({
@@ -237,9 +265,28 @@ app.get("/api/connections", auth, async (req, res) => {
 
         const result = conns.map(c => {
             const isMe = c.fromUser._id.toString() === req.user.toString();
-            return { connectionId: c._id, user: isMe ? c.toUser : c.fromUser, connectedAt: c.updatedAt };
+            const other = isMe ? c.toUser : c.fromUser;
+            return {
+                connectionId: c._id,
+                user: {
+                    ...other,
+                    isOnline: onlineUsers.has(other._id.toString()),
+                },
+                connectedAt: c.updatedAt,
+            };
         });
         res.status(200).json(result);
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ── FEATURE #1 FIX: Connection count for profile ──
+app.get("/api/connections/count", auth, async (req, res) => {
+    try {
+        const count = await Connection.countDocuments({
+            $or: [{ fromUser: req.user }, { toUser: req.user }],
+            status: "accepted",
+        });
+        res.status(200).json({ count });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -261,49 +308,138 @@ app.get("/api/messages/:connectionId", auth, async (req, res) => {
         const msgs = await Message.find({ connectionId: req.params.connectionId })
             .populate("senderUser", "username photoURL")
             .sort({ createdAt: 1 }).lean();
+
         res.status(200).json(msgs);
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ── FEATURE #6: Mark messages as seen ──
+app.post("/api/messages/:connectionId/seen", auth, async (req, res) => {
+    try {
+        const conn = await Connection.findById(req.params.connectionId);
+        if (!conn) return res.status(404).json({ message: "Not found" });
+        const isInvolved =
+            conn.fromUser.toString() === req.user.toString() ||
+            conn.toUser.toString()   === req.user.toString();
+        if (!isInvolved) return res.status(403).json({ message: "Not authorized" });
+
+        // Mark all messages NOT sent by me as seen
+        const result = await Message.updateMany(
+            {
+                connectionId: req.params.connectionId,
+                senderUser: { $ne: req.user },
+                seen: false,
+                isDeleted: false,
+            },
+            { $set: { seen: true, seenAt: new Date() } }
+        );
+
+        // Emit seen event via socket so sender's UI updates
+        io.to(req.params.connectionId).emit("messages_seen", {
+            connectionId: req.params.connectionId,
+            seenBy: req.user,
+            seenAt: new Date(),
+        });
+
+        res.status(200).json({ updated: result.modifiedCount });
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ── FEATURE #5: Unread count per connection ──
+app.get("/api/messages/:connectionId/unread", auth, async (req, res) => {
+    try {
+        const count = await Message.countDocuments({
+            connectionId: req.params.connectionId,
+            senderUser: { $ne: req.user },
+            seen: false,
+            isDeleted: false,
+        });
+        res.status(200).json({ count });
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ── FEATURE #7: Soft-delete a message ──
+app.delete("/api/messages/:messageId", auth, async (req, res) => {
+    try {
+        const msg = await Message.findById(req.params.messageId);
+        if (!msg) return res.status(404).json({ message: "Message not found" });
+        if (msg.senderUser.toString() !== req.user.toString())
+            return res.status(403).json({ message: "You can only delete your own messages" });
+
+        msg.isDeleted = true;
+        await msg.save();
+
+        // Notify everyone in the chat room
+        io.to(msg.connectionId.toString()).emit("message_deleted", {
+            messageId: msg._id,
+            connectionId: msg.connectionId,
+        });
+
+        res.status(200).json({ message: "Deleted" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
 
 /* ════════════════════════════════════════════════
-   SOCKET.IO — Live Chat
+   SOCKET.IO — Live Chat + Presence
 ════════════════════════════════════════════════ */
 io.on("connection", socket => {
 
-    // User identifies themselves
+    // ── User comes online ──
     socket.on("user_online", userId => {
         socket.userId = userId;
-        socket.join(`user_${userId}`);      // personal room for notifications
+        socket.join(`user_${userId}`);
+        onlineUsers.set(userId, socket.id);
+        // Broadcast to everyone that this user is online
+        socket.broadcast.emit("user_status_change", { userId, isOnline: true });
     });
 
-    // Join a chat room (one room per connection)
+    // ── Join a chat room ──
     socket.on("join_chat", connectionId => {
         socket.join(connectionId);
     });
 
-    // Send a message
+    // ── Send a message ──
     socket.on("send_message", async ({ connectionId, senderUserId, text }) => {
         try {
             if (!text?.trim()) return;
 
-            // Save to DB
-            const msg = await Message.create({ connectionId, senderUser: senderUserId, text: text.trim() });
+            const msg = await Message.create({
+                connectionId,
+                senderUser: senderUserId,
+                text: text.trim(),
+            });
             const populated = await Message.findById(msg._id)
                 .populate("senderUser", "username photoURL").lean();
 
-            // Broadcast to both users in the chat room
             io.to(connectionId).emit("new_message", populated);
 
         } catch (e) { console.log("msg error:", e); }
     });
 
-    // Typing indicator
+    // ── Typing indicator ──
     socket.on("typing", ({ connectionId, isTyping }) => {
         socket.to(connectionId).emit("user_typing", { userId: socket.userId, isTyping });
     });
 
-    socket.on("disconnect", () => {
+    // ── User disconnects ──
+    socket.on("disconnect", async () => {
+        const userId = socket.userId;
+        if (userId) {
+            onlineUsers.delete(userId);
+
+            // ── FEATURE #4: Update lastSeen ──
+            try {
+                await User.findByIdAndUpdate(userId, { lastSeen: new Date() });
+            } catch (e) { console.log("lastSeen update error:", e); }
+
+            // Broadcast offline status
+            socket.broadcast.emit("user_status_change", {
+                userId,
+                isOnline: false,
+                lastSeen: new Date(),
+            });
+        }
         console.log("Socket disconnected:", socket.id);
     });
 });
@@ -321,14 +457,24 @@ mongoose.connect(process.env.MONGO_URI)
         const PORT = process.env.PORT || 5500;
         httpServer.listen(PORT, () => {
             console.log(`Server running on port ${PORT}`);
-            console.log(`Routes ready:`);
-            console.log(`  POST /api/auth/register`);
-            console.log(`  POST /api/auth/login`);
-            console.log(`  PUT  /api/auth/profile`);
-            console.log(`  GET  /api/users/discover`);
-            console.log(`  POST /api/connections/request`);
-            console.log(`  GET  /api/connections/requests`);
-            console.log(`  GET  /api/messages/:connectionId`);
+            console.log("Routes:");
+            console.log("  POST   /api/auth/register");
+            console.log("  POST   /api/auth/login");
+            console.log("  GET    /api/auth/me");
+            console.log("  PUT    /api/auth/profile");
+            console.log("  GET    /api/users/discover");
+            console.log("  GET    /api/users");
+            console.log("  GET    /api/users/:id");
+            console.log("  POST   /api/connections/request");
+            console.log("  POST   /api/connections/accept");
+            console.log("  POST   /api/connections/reject");
+            console.log("  GET    /api/connections/requests");
+            console.log("  GET    /api/connections");
+            console.log("  GET    /api/connections/count");
+            console.log("  GET    /api/messages/:connectionId");
+            console.log("  POST   /api/messages/:connectionId/seen");
+            console.log("  GET    /api/messages/:connectionId/unread");
+            console.log("  DELETE /api/messages/:messageId");
         });
     })
     .catch(err => console.log("Mongo Error:", err));
