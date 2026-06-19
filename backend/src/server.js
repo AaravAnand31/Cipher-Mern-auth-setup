@@ -151,16 +151,48 @@ app.get("/api/users/online", auth, (req, res) => {
 
 app.get("/api/users", auth, async (req, res) => {
     try {
-        const me = req.user;
-        const s  = req.query.search || "";
+        const me    = req.user;
+        const s     = (req.query.search || "").trim();
+        const limit = parseInt(req.query.limit) || 20;
+
         const filter = { _id: { $ne: me } };
-        if (s) filter.$or = [
-            { username:   { $regex: s, $options: "i" } },
-            { department: { $regex: s, $options: "i" } },
-            { interests:  { $elemMatch: { $regex: s, $options: "i" } } },
-        ];
-        const users = await User.find(filter).select("-password").limit(20).lean();
-        res.status(200).json(users.map(u => ({ ...u, isOnline: onlineUsers.has(u._id.toString()) })));
+
+        if (s) {
+            // Split the typed query into individual words so "arihant jain"
+            // matches a username regardless of word order or extra spacing.
+            // Every word must match SOMEWHERE (username, department, or interests).
+            const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const words = s.split(/\s+/).filter(Boolean).map(escapeRegex);
+
+            filter.$and = words.map(word => ({
+                $or: [
+                    { username:   { $regex: word, $options: "i" } },
+                    { department: { $regex: word, $options: "i" } },
+                    { interests:  { $elemMatch: { $regex: word, $options: "i" } } },
+                    { year:       { $regex: word, $options: "i" } },
+                ]
+            }));
+        }
+
+        // Get my existing connections so we can mark their status
+        const myConns = await Connection.find({
+            $or: [{ fromUser: me }, { toUser: me }]
+        }).lean();
+
+        const statusMap = new Map();
+        myConns.forEach(c => {
+            const otherId = c.fromUser.toString() === me.toString()
+                ? c.toUser.toString() : c.fromUser.toString();
+            statusMap.set(otherId, c.status);
+        });
+
+        const users = await User.find(filter).select("-password").limit(limit).lean();
+
+        res.status(200).json(users.map(u => ({
+            ...u,
+            isOnline: onlineUsers.has(u._id.toString()),
+            connectionStatus: statusMap.get(u._id.toString()) || 'none',
+        })));
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
