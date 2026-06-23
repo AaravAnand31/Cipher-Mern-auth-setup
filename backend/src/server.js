@@ -65,6 +65,18 @@ function auth(req, res, next) {
 }
 
 /* ═══════════════════════════════════════════════
+   EMAIL VALIDATION — Gmail-only
+   Reused by /register and /login. Frontend has its
+   own copy too; this is the authoritative check
+   since client-side validation can be bypassed.
+═══════════════════════════════════════════════ */
+function isGmailAddress(email) {
+    const clean = String(email || "").trim().toLowerCase();
+    return clean.endsWith("@gmail.com");
+}
+const GMAIL_ONLY_MESSAGE = "Only Gmail addresses (@gmail.com) are allowed.";
+
+/* ═══════════════════════════════════════════════
    ONLINE USERS MAP  userId(string) → socketId
 ═══════════════════════════════════════════════ */
 const onlineUsers = new Map();
@@ -85,7 +97,13 @@ app.use(express.json({ limit: "15mb" }));
 ═══════════════════════════════════════════════ */
 app.post("/api/auth/register", async (req, res) => {
     try {
-        const { username, email, password } = req.body;
+        const { username, password } = req.body;
+        const email = String(req.body.email || "").trim().toLowerCase();
+
+        if (!isGmailAddress(email)) {
+            return res.status(400).json({ message: GMAIL_ONLY_MESSAGE });
+        }
+
         if (await User.findOne({ email }))
             return res.status(400).json({ message: "User already exists" });
         const hashed = await bcrypt.hash(password, 10);
@@ -96,7 +114,13 @@ app.post("/api/auth/register", async (req, res) => {
 
 app.post("/api/auth/login", async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const password = req.body.password;
+        const email = String(req.body.email || "").trim().toLowerCase();
+
+        if (!isGmailAddress(email)) {
+            return res.status(400).json({ message: GMAIL_ONLY_MESSAGE });
+        }
+
         const user = await User.findOne({ email });
         if (!user || !(await bcrypt.compare(password, user.password)))
             return res.status(400).json({ message: "Invalid credentials" });
@@ -151,48 +175,16 @@ app.get("/api/users/online", auth, (req, res) => {
 
 app.get("/api/users", auth, async (req, res) => {
     try {
-        const me    = req.user;
-        const s     = (req.query.search || "").trim();
-        const limit = parseInt(req.query.limit) || 20;
-
+        const me = req.user;
+        const s  = req.query.search || "";
         const filter = { _id: { $ne: me } };
-
-        if (s) {
-            // Split the typed query into individual words so "arihant jain"
-            // matches a username regardless of word order or extra spacing.
-            // Every word must match SOMEWHERE (username, department, or interests).
-            const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const words = s.split(/\s+/).filter(Boolean).map(escapeRegex);
-
-            filter.$and = words.map(word => ({
-                $or: [
-                    { username:   { $regex: word, $options: "i" } },
-                    { department: { $regex: word, $options: "i" } },
-                    { interests:  { $elemMatch: { $regex: word, $options: "i" } } },
-                    { year:       { $regex: word, $options: "i" } },
-                ]
-            }));
-        }
-
-        // Get my existing connections so we can mark their status
-        const myConns = await Connection.find({
-            $or: [{ fromUser: me }, { toUser: me }]
-        }).lean();
-
-        const statusMap = new Map();
-        myConns.forEach(c => {
-            const otherId = c.fromUser.toString() === me.toString()
-                ? c.toUser.toString() : c.fromUser.toString();
-            statusMap.set(otherId, c.status);
-        });
-
-        const users = await User.find(filter).select("-password").limit(limit).lean();
-
-        res.status(200).json(users.map(u => ({
-            ...u,
-            isOnline: onlineUsers.has(u._id.toString()),
-            connectionStatus: statusMap.get(u._id.toString()) || 'none',
-        })));
+        if (s) filter.$or = [
+            { username:   { $regex: s, $options: "i" } },
+            { department: { $regex: s, $options: "i" } },
+            { interests:  { $elemMatch: { $regex: s, $options: "i" } } },
+        ];
+        const users = await User.find(filter).select("-password").limit(20).lean();
+        res.status(200).json(users.map(u => ({ ...u, isOnline: onlineUsers.has(u._id.toString()) })));
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
