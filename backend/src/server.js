@@ -8,7 +8,7 @@ const jwt      = require("jsonwebtoken");
 const http     = require("http");
 const { Server } = require("socket.io");
 
-console.log("Starting Cipher server...");
+console.log("Starting Fliqr server...");
 
 /* ═══════════════════════════════════════════════
    SCHEMAS
@@ -473,7 +473,7 @@ io.on("connection", socket => {
 mongoose.connect(process.env.MONGO_URI)
     .then(() => {
         console.log("MongoDB Connected ✓");
-        app.get("/", (req, res) => res.send("Cipher Backend ✓"));
+        app.get("/", (req, res) => res.send("Fliqr Backend ✓"));
         const PORT = process.env.PORT || 5500;
         httpServer.listen(PORT, () => console.log(`Server running on port ${PORT} ✓`));
     })
