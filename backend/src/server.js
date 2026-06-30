@@ -190,9 +190,40 @@ app.get("/api/users", auth, async (req, res) => {
 
 app.get("/api/users/:id", auth, async (req, res) => {
     try {
+        const me = req.user;
         const user = await User.findById(req.params.id).select("-password").lean();
         if (!user) return res.status(404).json({ message: "Not found" });
-        res.status(200).json({ ...user, isOnline: onlineUsers.has(user._id.toString()) });
+
+        // Look up any existing connection between me and this user (either direction)
+        const conn = await Connection.findOne({
+            $or: [
+                { fromUser: me, toUser: user._id },
+                { fromUser: user._id, toUser: me },
+            ]
+        }).lean();
+
+        let connectionStatus = "none";       // none | pending_sent | pending_received | accepted | rejected
+        let connectionId = null;
+
+        if (conn) {
+            connectionId = conn._id;
+            if (conn.status === "accepted") {
+                connectionStatus = "accepted";
+            } else if (conn.status === "pending") {
+                connectionStatus = conn.fromUser.toString() === me.toString()
+                    ? "pending_sent"      // I sent the request — show Withdraw
+                    : "pending_received";  // They sent it to me — show Accept/Decline
+            } else {
+                connectionStatus = conn.status; // rejected
+            }
+        }
+
+        res.status(200).json({
+            ...user,
+            isOnline: onlineUsers.has(user._id.toString()),
+            connectionStatus,
+            connectionId,
+        });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -238,6 +269,26 @@ app.post("/api/connections/reject", auth, async (req, res) => {
             return res.status(403).json({ message: "Not authorized" });
         conn.status = "rejected"; await conn.save();
         res.status(200).json({ message: "Rejected" });
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// Withdraw a request I sent — only the original sender can withdraw,
+// and only while it's still pending. Fully deletes the connection so
+// I'm free to send a fresh request later if I change my mind.
+app.post("/api/connections/withdraw", auth, async (req, res) => {
+    try {
+        const { connectionId } = req.body;
+        const conn = await Connection.findById(connectionId);
+        if (!conn) return res.status(404).json({ message: "Not found" });
+
+        if (conn.fromUser.toString() !== req.user.toString())
+            return res.status(403).json({ message: "You can only withdraw requests you sent" });
+
+        if (conn.status !== "pending")
+            return res.status(400).json({ message: "Only pending requests can be withdrawn" });
+
+        await Connection.deleteOne({ _id: connectionId });
+        res.status(200).json({ message: "Request withdrawn" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
