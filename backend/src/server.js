@@ -241,9 +241,17 @@ app.post("/api/connections/request", auth, async (req, res) => {
         });
         if (existing) return res.status(400).json({ message: `Already ${existing.status}` });
         const conn = await Connection.create({ fromUser: from, toUser: toUserId });
-        // Notify receiver
+
+        // Notify receiver live — both for the Requests badge AND so their
+        // View Profile screen (if open on me) flips to pending_received.
         const receiverSocket = onlineUsers.get(toUserId.toString());
-        if (receiverSocket) io.to(receiverSocket).emit("new_request", { fromUserId: from });
+        if (receiverSocket) {
+            io.to(receiverSocket).emit("new_request", {
+                connectionId: conn._id.toString(),
+                fromUserId: from.toString(),
+            });
+        }
+
         res.status(201).json({ message: "Request sent", connection: conn });
     } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
@@ -255,8 +263,16 @@ app.post("/api/connections/accept", auth, async (req, res) => {
         if (conn.toUser.toString() !== req.user.toString())
             return res.status(403).json({ message: "Not authorized" });
         conn.status = "accepted"; await conn.save();
+
+        // Notify original sender live — their pending button flips to Open Chat.
         const senderSocket = onlineUsers.get(conn.fromUser.toString());
-        if (senderSocket) io.to(senderSocket).emit("request_accepted", { by: req.user });
+        if (senderSocket) {
+            io.to(senderSocket).emit("request_accepted", {
+                connectionId: conn._id.toString(),
+                byUserId: req.user.toString(),
+            });
+        }
+
         res.status(200).json({ message: "Accepted", connection: conn });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
@@ -268,6 +284,17 @@ app.post("/api/connections/reject", auth, async (req, res) => {
         if (conn.toUser.toString() !== req.user.toString())
             return res.status(403).json({ message: "Not authorized" });
         conn.status = "rejected"; await conn.save();
+
+        // Notify the original sender live — their pending button needs
+        // to flip back to "Connect" without a page refresh.
+        const senderSocket = onlineUsers.get(conn.fromUser.toString());
+        if (senderSocket) {
+            io.to(senderSocket).emit("request_rejected", {
+                connectionId: conn._id.toString(),
+                byUserId: req.user.toString(),
+            });
+        }
+
         res.status(200).json({ message: "Rejected" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
@@ -287,7 +314,19 @@ app.post("/api/connections/withdraw", auth, async (req, res) => {
         if (conn.status !== "pending")
             return res.status(400).json({ message: "Only pending requests can be withdrawn" });
 
+        const receiverId = conn.toUser.toString();
         await Connection.deleteOne({ _id: connectionId });
+
+        // Notify the receiver live — the request must vanish from their
+        // Requests page instantly, not just after their next refresh.
+        const receiverSocket = onlineUsers.get(receiverId);
+        if (receiverSocket) {
+            io.to(receiverSocket).emit("request_withdrawn", {
+                connectionId: connectionId.toString(),
+                byUserId: req.user.toString(),
+            });
+        }
+
         res.status(200).json({ message: "Request withdrawn" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
