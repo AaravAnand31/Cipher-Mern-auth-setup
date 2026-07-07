@@ -8,7 +8,7 @@ const jwt      = require("jsonwebtoken");
 const http     = require("http");
 const { Server } = require("socket.io");
 
-console.log("Starting Fliqr server...");
+console.log("Starting Cipher server...");
 
 /* ═══════════════════════════════════════════════
    SCHEMAS
@@ -65,18 +65,6 @@ function auth(req, res, next) {
 }
 
 /* ═══════════════════════════════════════════════
-   EMAIL VALIDATION — Gmail-only
-   Reused by /register and /login. Frontend has its
-   own copy too; this is the authoritative check
-   since client-side validation can be bypassed.
-═══════════════════════════════════════════════ */
-function isGmailAddress(email) {
-    const clean = String(email || "").trim().toLowerCase();
-    return clean.endsWith("@gmail.com");
-}
-const GMAIL_ONLY_MESSAGE = "Only Gmail addresses (@gmail.com) are allowed.";
-
-/* ═══════════════════════════════════════════════
    ONLINE USERS MAP  userId(string) → socketId
 ═══════════════════════════════════════════════ */
 const onlineUsers = new Map();
@@ -97,13 +85,7 @@ app.use(express.json({ limit: "15mb" }));
 ═══════════════════════════════════════════════ */
 app.post("/api/auth/register", async (req, res) => {
     try {
-        const { username, password } = req.body;
-        const email = String(req.body.email || "").trim().toLowerCase();
-
-        if (!isGmailAddress(email)) {
-            return res.status(400).json({ message: GMAIL_ONLY_MESSAGE });
-        }
-
+        const { username, email, password } = req.body;
         if (await User.findOne({ email }))
             return res.status(400).json({ message: "User already exists" });
         const hashed = await bcrypt.hash(password, 10);
@@ -114,13 +96,7 @@ app.post("/api/auth/register", async (req, res) => {
 
 app.post("/api/auth/login", async (req, res) => {
     try {
-        const password = req.body.password;
-        const email = String(req.body.email || "").trim().toLowerCase();
-
-        if (!isGmailAddress(email)) {
-            return res.status(400).json({ message: GMAIL_ONLY_MESSAGE });
-        }
-
+        const { email, password } = req.body;
         const user = await User.findOne({ email });
         if (!user || !(await bcrypt.compare(password, user.password)))
             return res.status(400).json({ message: "Invalid credentials" });
@@ -190,20 +166,19 @@ app.get("/api/users", auth, async (req, res) => {
 
 app.get("/api/users/:id", auth, async (req, res) => {
     try {
-        const me = req.user;
+        const me   = req.user;
         const user = await User.findById(req.params.id).select("-password").lean();
         if (!user) return res.status(404).json({ message: "Not found" });
 
-        // Look up any existing connection between me and this user (either direction)
         const conn = await Connection.findOne({
             $or: [
-                { fromUser: me, toUser: user._id },
+                { fromUser: me,       toUser: user._id },
                 { fromUser: user._id, toUser: me },
             ]
         }).lean();
 
-        let connectionStatus = "none";       // none | pending_sent | pending_received | accepted | rejected
-        let connectionId = null;
+        let connectionStatus = "none";
+        let connectionId     = null;
 
         if (conn) {
             connectionId = conn._id;
@@ -211,10 +186,10 @@ app.get("/api/users/:id", auth, async (req, res) => {
                 connectionStatus = "accepted";
             } else if (conn.status === "pending") {
                 connectionStatus = conn.fromUser.toString() === me.toString()
-                    ? "pending_sent"      // I sent the request — show Withdraw
-                    : "pending_received";  // They sent it to me — show Accept/Decline
+                    ? "pending_sent"
+                    : "pending_received";
             } else {
-                connectionStatus = conn.status; // rejected
+                connectionStatus = conn.status;
             }
         }
 
@@ -241,17 +216,10 @@ app.post("/api/connections/request", auth, async (req, res) => {
         });
         if (existing) return res.status(400).json({ message: `Already ${existing.status}` });
         const conn = await Connection.create({ fromUser: from, toUser: toUserId });
-
-        // Notify receiver live — both for the Requests badge AND so their
-        // View Profile screen (if open on me) flips to pending_received.
         const receiverSocket = onlineUsers.get(toUserId.toString());
-        if (receiverSocket) {
-            io.to(receiverSocket).emit("new_request", {
-                connectionId: conn._id.toString(),
-                fromUserId: from.toString(),
-            });
-        }
-
+        if (receiverSocket) io.to(receiverSocket).emit("new_request", {
+            connectionId: conn._id.toString(), fromUserId: from.toString()
+        });
         res.status(201).json({ message: "Request sent", connection: conn });
     } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
@@ -263,71 +231,30 @@ app.post("/api/connections/accept", auth, async (req, res) => {
         if (conn.toUser.toString() !== req.user.toString())
             return res.status(403).json({ message: "Not authorized" });
         conn.status = "accepted"; await conn.save();
-
-        // Notify original sender live — their pending button flips to Open Chat.
         const senderSocket = onlineUsers.get(conn.fromUser.toString());
-        if (senderSocket) {
-            io.to(senderSocket).emit("request_accepted", {
-                connectionId: conn._id.toString(),
-                byUserId: req.user.toString(),
-            });
-        }
-
+        if (senderSocket) io.to(senderSocket).emit("request_accepted", {
+            connectionId: conn._id.toString(), byUserId: req.user.toString()
+        });
         res.status(200).json({ message: "Accepted", connection: conn });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
-app.post("/api/connections/reject", auth, async (req, res) => {
+// Cancel/withdraw a request I sent — deletes it so receiver's list updates too
+app.post("/api/connections/withdraw", auth, async (req, res) => {
     try {
         const conn = await Connection.findById(req.body.connectionId);
         if (!conn) return res.status(404).json({ message: "Not found" });
-        if (conn.toUser.toString() !== req.user.toString())
-            return res.status(403).json({ message: "Not authorized" });
-        conn.status = "rejected"; await conn.save();
-
-        // Notify the original sender live — their pending button needs
-        // to flip back to "Connect" without a page refresh.
-        const senderSocket = onlineUsers.get(conn.fromUser.toString());
-        if (senderSocket) {
-            io.to(senderSocket).emit("request_rejected", {
-                connectionId: conn._id.toString(),
-                byUserId: req.user.toString(),
-            });
-        }
-
-        res.status(200).json({ message: "Rejected" });
-    } catch (e) { res.status(500).json({ message: "Server error" }); }
-});
-
-// Withdraw a request I sent — only the original sender can withdraw,
-// and only while it's still pending. Fully deletes the connection so
-// I'm free to send a fresh request later if I change my mind.
-app.post("/api/connections/withdraw", auth, async (req, res) => {
-    try {
-        const { connectionId } = req.body;
-        const conn = await Connection.findById(connectionId);
-        if (!conn) return res.status(404).json({ message: "Not found" });
-
         if (conn.fromUser.toString() !== req.user.toString())
-            return res.status(403).json({ message: "You can only withdraw requests you sent" });
-
+            return res.status(403).json({ message: "Only the sender can cancel" });
         if (conn.status !== "pending")
-            return res.status(400).json({ message: "Only pending requests can be withdrawn" });
-
+            return res.status(400).json({ message: "Only pending requests can be cancelled" });
         const receiverId = conn.toUser.toString();
-        await Connection.deleteOne({ _id: connectionId });
-
-        // Notify the receiver live — the request must vanish from their
-        // Requests page instantly, not just after their next refresh.
+        await Connection.deleteOne({ _id: conn._id });
         const receiverSocket = onlineUsers.get(receiverId);
-        if (receiverSocket) {
-            io.to(receiverSocket).emit("request_withdrawn", {
-                connectionId: connectionId.toString(),
-                byUserId: req.user.toString(),
-            });
-        }
-
-        res.status(200).json({ message: "Request withdrawn" });
+        if (receiverSocket) io.to(receiverSocket).emit("request_withdrawn", {
+            connectionId: conn._id.toString(), byUserId: req.user.toString()
+        });
+        res.status(200).json({ message: "Request cancelled" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -563,7 +490,7 @@ io.on("connection", socket => {
 mongoose.connect(process.env.MONGO_URI)
     .then(() => {
         console.log("MongoDB Connected ✓");
-        app.get("/", (req, res) => res.send("Fliqr Backend ✓"));
+        app.get("/", (req, res) => res.send("Cipher Backend ✓"));
         const PORT = process.env.PORT || 5500;
         httpServer.listen(PORT, () => console.log(`Server running on port ${PORT} ✓`));
     })
