@@ -29,31 +29,7 @@ const User = mongoose.model("User", new mongoose.Schema({
     coverURL:    { type: String,   default: "" },
     profileDone: { type: Boolean,  default: false },
     lastSeen:    { type: Date,     default: null  },
-    // "organizer" accounts can post/edit/delete campus events.
-    // Everyone starts as "student" — flip to "organizer" manually in
-    // MongoDB Atlas for event-planning leads (see deployment notes).
-    role:        { type: String, enum: ["student", "organizer"], default: "student" },
 }, { timestamps: true }));
-
-const eventSchema = new mongoose.Schema({
-    title:        { type: String, required: true },
-    description:  { type: String, default: "" },
-    coverImages:  { type: [String], default: [] },   // base64 data URIs, first = main banner
-    eventDate:    { type: Date,   required: true },
-    location:     { type: String, default: "" },
-    organizers: [{
-        name:      { type: String, default: "" },
-        contact:   { type: String, default: "" },   // phone or email, shown as tap-to-call/email
-        roleTitle: { type: String, default: "" },   // e.g. "Event Lead", optional
-    }],
-    applyLink:    { type: String, default: "" },
-    createdBy:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-}, { timestamps: true });
-
-eventSchema.index({ eventDate: 1 });
-eventSchema.index({ createdAt: -1 });
-
-const Event = mongoose.model("Event", eventSchema);
 
 const connSchema = new mongoose.Schema({
     fromUser: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -85,20 +61,6 @@ function auth(req, res, next) {
         next();
     } catch (e) {
         res.status(401).json({ message: "Invalid token" });
-    }
-}
-
-// Gate for event create/edit/delete — only "organizer" role accounts.
-// Must run after auth() since it needs req.user already set.
-async function requireOrganizer(req, res, next) {
-    try {
-        const user = await User.findById(req.user).select("role");
-        if (!user || user.role !== "organizer") {
-            return res.status(403).json({ message: "Only event organizers can do this" });
-        }
-        next();
-    } catch (e) {
-        res.status(500).json({ message: "Server error" });
     }
 }
 
@@ -313,99 +275,6 @@ app.get("/api/connections/count", auth, async (req, res) => {
             $or: [{ fromUser: req.user }, { toUser: req.user }], status: "accepted",
         });
         res.status(200).json({ count });
-    } catch (e) { res.status(500).json({ message: "Server error" }); }
-});
-
-
-/* ═══════════════════════════════════════════════
-   EVENTS
-   Any logged-in user can VIEW events.
-   Only "organizer" role accounts can create/edit/delete.
-═══════════════════════════════════════════════ */
-
-// List all events — newest posted first, so "when we open the tab,
-// the latest event appears" (as requested).
-app.get("/api/events", auth, async (req, res) => {
-    try {
-        const events = await Event.find({})
-            .select("title coverImages eventDate location createdAt")
-            .sort({ createdAt: -1 })
-            .lean();
-        res.status(200).json(events);
-    } catch (e) { res.status(500).json({ message: "Server error" }); }
-});
-
-// Single event — full detail including organizers + apply link
-app.get("/api/events/:id", auth, async (req, res) => {
-    try {
-        if (!mongoose.Types.ObjectId.isValid(req.params.id))
-            return res.status(400).json({ message: "Invalid event ID" });
-
-        const event = await Event.findById(req.params.id)
-            .populate("createdBy", "username photoURL")
-            .lean();
-
-        if (!event) return res.status(404).json({ message: "Event not found" });
-        res.status(200).json(event);
-    } catch (e) { res.status(500).json({ message: "Server error" }); }
-});
-
-// Create — organizer only
-app.post("/api/events", auth, requireOrganizer, async (req, res) => {
-    try {
-        const { title, description, coverImages, eventDate, location, organizers, applyLink } = req.body;
-
-        if (!title?.trim()) return res.status(400).json({ message: "Title is required" });
-        if (!eventDate)      return res.status(400).json({ message: "Event date is required" });
-
-        const event = await Event.create({
-            title:       title.trim(),
-            description: description?.trim() || "",
-            coverImages: Array.isArray(coverImages) ? coverImages.slice(0, 6) : [],
-            eventDate:   new Date(eventDate),
-            location:    location?.trim() || "",
-            organizers:  Array.isArray(organizers) ? organizers.filter(o => o.name?.trim()) : [],
-            applyLink:   applyLink?.trim() || "",
-            createdBy:   req.user,
-        });
-
-        res.status(201).json({ message: "Event created", event });
-    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
-});
-
-// Update — organizer only (any organizer can edit any event — shared team model)
-app.put("/api/events/:id", auth, requireOrganizer, async (req, res) => {
-    try {
-        if (!mongoose.Types.ObjectId.isValid(req.params.id))
-            return res.status(400).json({ message: "Invalid event ID" });
-
-        const { title, description, coverImages, eventDate, location, organizers, applyLink } = req.body;
-        const updates = {};
-        if (title !== undefined)       updates.title       = title.trim();
-        if (description !== undefined) updates.description = description.trim();
-        if (coverImages !== undefined) updates.coverImages = Array.isArray(coverImages) ? coverImages.slice(0, 6) : [];
-        if (eventDate !== undefined)   updates.eventDate   = new Date(eventDate);
-        if (location !== undefined)    updates.location    = location.trim();
-        if (organizers !== undefined)  updates.organizers  = Array.isArray(organizers) ? organizers.filter(o => o.name?.trim()) : [];
-        if (applyLink !== undefined)   updates.applyLink   = applyLink.trim();
-
-        const event = await Event.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true });
-        if (!event) return res.status(404).json({ message: "Event not found" });
-
-        res.status(200).json({ message: "Event updated", event });
-    } catch (e) { res.status(500).json({ message: "Server error" }); }
-});
-
-// Delete — organizer only
-app.delete("/api/events/:id", auth, requireOrganizer, async (req, res) => {
-    try {
-        if (!mongoose.Types.ObjectId.isValid(req.params.id))
-            return res.status(400).json({ message: "Invalid event ID" });
-
-        const event = await Event.findByIdAndDelete(req.params.id);
-        if (!event) return res.status(404).json({ message: "Event not found" });
-
-        res.status(200).json({ message: "Event deleted" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
