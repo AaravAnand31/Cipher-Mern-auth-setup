@@ -29,7 +29,31 @@ const User = mongoose.model("User", new mongoose.Schema({
     coverURL:    { type: String,   default: "" },
     profileDone: { type: Boolean,  default: false },
     lastSeen:    { type: Date,     default: null  },
+    // "organizer" accounts can post/edit/delete campus events.
+    // Everyone starts as "student" — flip to "organizer" manually in
+    // MongoDB Atlas for event-planning leads (see deployment notes).
+    role:        { type: String, enum: ["student", "organizer"], default: "student" },
 }, { timestamps: true }));
+
+const eventSchema = new mongoose.Schema({
+    title:        { type: String, required: true },
+    description:  { type: String, default: "" },
+    coverImages:  { type: [String], default: [] },   // base64 data URIs, first = main banner
+    eventDate:    { type: Date,   required: true },
+    location:     { type: String, default: "" },
+    organizers: [{
+        name:      { type: String, default: "" },
+        contact:   { type: String, default: "" },   // phone or email, shown as tap-to-call/email
+        roleTitle: { type: String, default: "" },   // e.g. "Event Lead", optional
+    }],
+    applyLink:    { type: String, default: "" },
+    createdBy:    { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+}, { timestamps: true });
+
+eventSchema.index({ eventDate: 1 });
+eventSchema.index({ createdAt: -1 });
+
+const Event = mongoose.model("Event", eventSchema);
 
 const connSchema = new mongoose.Schema({
     fromUser: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -48,17 +72,6 @@ const Message = mongoose.model("Message", new mongoose.Schema({
     isDeleted:    { type: Boolean, default: false },
 }, { timestamps: true }));
 
-// Indexes — critical for performance as message volume grows
-// Chat history: sorted by time within a conversation
-Message.schema.index({ connectionId: 1, createdAt: 1 });
-// Unread counts: filter unseen messages per sender within a conversation
-Message.schema.index({ connectionId: 1, senderUser: 1, seen: 1, isDeleted: 1 });
-
-// Connection indexes beyond the unique compound one already defined
-connSchema.index({ toUser: 1, status: 1 });    // pending requests to me
-connSchema.index({ fromUser: 1, status: 1 });  // my sent requests / accepted conns
-connSchema.index({ status: 1 });               // filtering by status globally
-
 
 /* ═══════════════════════════════════════════════
    AUTH MIDDLEWARE
@@ -75,6 +88,20 @@ function auth(req, res, next) {
     }
 }
 
+// Gate for event create/edit/delete — only "organizer" role accounts.
+// Must run after auth() since it needs req.user already set.
+async function requireOrganizer(req, res, next) {
+    try {
+        const user = await User.findById(req.user).select("role");
+        if (!user || user.role !== "organizer") {
+            return res.status(403).json({ message: "Only event organizers can do this" });
+        }
+        next();
+    } catch (e) {
+        res.status(500).json({ message: "Server error" });
+    }
+}
+
 /* ═══════════════════════════════════════════════
    ONLINE USERS MAP  userId(string) → socketId
 ═══════════════════════════════════════════════ */
@@ -88,14 +115,7 @@ const httpServer = http.createServer(app);
 const io         = new Server(httpServer, { cors: { origin: "*" } });
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));  // 15mb was too permissive — profiles don't need that
-
-// Compress all responses — reduces data sent over the wire significantly
-// especially for large chat history or user lists
-try {
-    const compression = require("compression");
-    app.use(compression());
-} catch (_) { /* compression is optional — works fine without it */ }
+app.use(express.json({ limit: "15mb" }));
 
 
 /* ═══════════════════════════════════════════════
@@ -153,27 +173,13 @@ app.get("/api/users/discover", auth, async (req, res) => {
         const me    = req.user;
         const limit = parseInt(req.query.limit) || 10;
         const skip  = parseInt(req.query.skip)  || 0;
-
-        // Only fetch the IDs we need to exclude — no populate, lean, projection only
-        // Uses the compound index (fromUser,status) and (toUser,status)
-        const myConns = await Connection.find(
-            { $or: [{ fromUser: me }, { toUser: me }] },
-            { fromUser: 1, toUser: 1 }   // projection — only fetch what we need
-        ).lean();
-
-        const hideIds = myConns.map(c =>
+        const myConns = await Connection.find({ $or:[{fromUser:me},{toUser:me}] }).lean();
+        const hide = [me, ...myConns.map(c =>
             c.fromUser.toString() === me.toString() ? c.toUser : c.fromUser
-        );
-        hideIds.push(me);
-
-        const users = await User.find(
-            { _id: { $nin: hideIds }, profileDone: true },  // only show completed profiles
-            { password: 0, coverURL: 0 }  // exclude heavy fields from list view
-        ).limit(limit).skip(skip).lean();
-
-        res.status(200).json(users.map(u => ({
-            ...u, isOnline: onlineUsers.has(u._id.toString())
-        })));
+        )];
+        const users = await User.find({ _id: { $nin: hide } })
+            .select("-password").limit(limit).skip(skip).lean();
+        res.status(200).json(users.map(u => ({ ...u, isOnline: onlineUsers.has(u._id.toString()) })));
     } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
 
@@ -198,39 +204,9 @@ app.get("/api/users", auth, async (req, res) => {
 
 app.get("/api/users/:id", auth, async (req, res) => {
     try {
-        const me   = req.user;
         const user = await User.findById(req.params.id).select("-password").lean();
         if (!user) return res.status(404).json({ message: "Not found" });
-
-        const conn = await Connection.findOne({
-            $or: [
-                { fromUser: me,       toUser: user._id },
-                { fromUser: user._id, toUser: me },
-            ]
-        }).lean();
-
-        let connectionStatus = "none";
-        let connectionId     = null;
-
-        if (conn) {
-            connectionId = conn._id;
-            if (conn.status === "accepted") {
-                connectionStatus = "accepted";
-            } else if (conn.status === "pending") {
-                connectionStatus = conn.fromUser.toString() === me.toString()
-                    ? "pending_sent"
-                    : "pending_received";
-            } else {
-                connectionStatus = conn.status;
-            }
-        }
-
-        res.status(200).json({
-            ...user,
-            isOnline: onlineUsers.has(user._id.toString()),
-            connectionStatus,
-            connectionId,
-        });
+        res.status(200).json({ ...user, isOnline: onlineUsers.has(user._id.toString()) });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -248,10 +224,9 @@ app.post("/api/connections/request", auth, async (req, res) => {
         });
         if (existing) return res.status(400).json({ message: `Already ${existing.status}` });
         const conn = await Connection.create({ fromUser: from, toUser: toUserId });
+        // Notify receiver
         const receiverSocket = onlineUsers.get(toUserId.toString());
-        if (receiverSocket) io.to(receiverSocket).emit("new_request", {
-            connectionId: conn._id.toString(), fromUserId: from.toString()
-        });
+        if (receiverSocket) io.to(receiverSocket).emit("new_request", { fromUserId: from });
         res.status(201).json({ message: "Request sent", connection: conn });
     } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
@@ -263,33 +238,20 @@ app.post("/api/connections/accept", auth, async (req, res) => {
         if (conn.toUser.toString() !== req.user.toString())
             return res.status(403).json({ message: "Not authorized" });
         conn.status = "accepted"; await conn.save();
-        // Invalidate cache so online/offline notifications work immediately
-        invalidateConnCache(conn.fromUser.toString(), conn.toUser.toString());
         const senderSocket = onlineUsers.get(conn.fromUser.toString());
-        if (senderSocket) io.to(senderSocket).emit("request_accepted", {
-            connectionId: conn._id.toString(), byUserId: req.user.toString()
-        });
+        if (senderSocket) io.to(senderSocket).emit("request_accepted", { by: req.user });
         res.status(200).json({ message: "Accepted", connection: conn });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
-// Cancel/withdraw a request I sent — deletes it so receiver's list updates too
-app.post("/api/connections/withdraw", auth, async (req, res) => {
+app.post("/api/connections/reject", auth, async (req, res) => {
     try {
         const conn = await Connection.findById(req.body.connectionId);
         if (!conn) return res.status(404).json({ message: "Not found" });
-        if (conn.fromUser.toString() !== req.user.toString())
-            return res.status(403).json({ message: "Only the sender can cancel" });
-        if (conn.status !== "pending")
-            return res.status(400).json({ message: "Only pending requests can be cancelled" });
-        const receiverId = conn.toUser.toString();
-        await Connection.deleteOne({ _id: conn._id });
-        invalidateConnCache(conn.fromUser.toString(), receiverId);
-        const receiverSocket = onlineUsers.get(receiverId);
-        if (receiverSocket) io.to(receiverSocket).emit("request_withdrawn", {
-            connectionId: conn._id.toString(), byUserId: req.user.toString()
-        });
-        res.status(200).json({ message: "Request cancelled" });
+        if (conn.toUser.toString() !== req.user.toString())
+            return res.status(403).json({ message: "Not authorized" });
+        conn.status = "rejected"; await conn.save();
+        res.status(200).json({ message: "Rejected" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -308,49 +270,21 @@ app.get("/api/connections", auth, async (req, res) => {
         const userId = req.user;
         const conns  = await Connection.find({
             $or: [{ fromUser: userId }, { toUser: userId }], status: "accepted",
-        }, { fromUser: 1, toUser: 1, updatedAt: 1 })
-        .populate("fromUser", "-password -coverURL")
-        .populate("toUser",   "-password -coverURL")
-        .lean();
+        }).populate("fromUser", "-password").populate("toUser", "-password").lean();
 
-        if (!conns.length) return res.status(200).json([]);
-
-        const connIds = conns.map(c => c._id);
-
-        // Single aggregation replaces N separate countDocuments calls
-        // Groups all unseen messages by connectionId in one DB round-trip
-        const unreadAgg = await Message.aggregate([
-            {
-                $match: {
-                    connectionId: { $in: connIds },
-                    senderUser:   { $ne: userId },
-                    seen:         false,
-                    isDeleted:    false,
-                }
-            },
-            {
-                $group: {
-                    _id: "$connectionId",
-                    count: { $sum: 1 }
-                }
-            }
-        ]);
-
-        // Build a fast lookup map from the aggregation result
-        const unreadMap = {};
-        unreadAgg.forEach(r => { unreadMap[r._id.toString()] = r.count; });
-
-        const result = conns.map(c => {
+        const result = await Promise.all(conns.map(async c => {
             const isMe  = c.fromUser._id.toString() === userId.toString();
             const other = isMe ? c.toUser : c.fromUser;
+            const unreadCount = await Message.countDocuments({
+                connectionId: c._id, senderUser: other._id, seen: false, isDeleted: false,
+            });
             return {
                 connectionId: c._id,
                 user: { ...other, isOnline: onlineUsers.has(other._id.toString()) },
                 connectedAt: c.updatedAt,
-                unreadCount: unreadMap[c._id.toString()] || 0,
+                unreadCount,
             };
-        });
-
+        }));
         result.sort((a, b) => b.unreadCount - a.unreadCount);
         res.status(200).json(result);
     } catch (e) { res.status(500).json({ message: "Server error" }); }
@@ -358,32 +292,18 @@ app.get("/api/connections", auth, async (req, res) => {
 
 app.get("/api/connections/unread-total", auth, async (req, res) => {
     try {
-        const userId = req.user;
-
-        // Get all accepted connection IDs in one query (IDs only, no populate needed)
-        const myConns = await Connection.find(
-            { $or: [{ fromUser: userId }, { toUser: userId }], status: "accepted" },
-            { _id: 1 }
-        ).lean();
-
-        if (!myConns.length) return res.status(200).json({ total: 0 });
-
-        // Single aggregation — count all unseen messages not sent by me
-        const result = await Message.aggregate([
-            {
-                $match: {
-                    connectionId: { $in: myConns.map(c => c._id) },
-                    senderUser:   { $ne: userId },
-                    seen:         false,
-                    isDeleted:    false,
-                }
-            },
-            {
-                $count: "total"
-            }
-        ]);
-
-        res.status(200).json({ total: result[0]?.total || 0 });
+        const userId  = req.user;
+        const myConns = await Connection.find({
+            $or: [{ fromUser: userId }, { toUser: userId }], status: "accepted",
+        }).lean();
+        let total = 0;
+        for (const c of myConns) {
+            const otherId = c.fromUser.toString() === userId.toString() ? c.toUser : c.fromUser;
+            total += await Message.countDocuments({
+                connectionId: c._id, senderUser: otherId, seen: false, isDeleted: false,
+            });
+        }
+        res.status(200).json({ total });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -393,6 +313,99 @@ app.get("/api/connections/count", auth, async (req, res) => {
             $or: [{ fromUser: req.user }, { toUser: req.user }], status: "accepted",
         });
         res.status(200).json({ count });
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+
+/* ═══════════════════════════════════════════════
+   EVENTS
+   Any logged-in user can VIEW events.
+   Only "organizer" role accounts can create/edit/delete.
+═══════════════════════════════════════════════ */
+
+// List all events — newest posted first, so "when we open the tab,
+// the latest event appears" (as requested).
+app.get("/api/events", auth, async (req, res) => {
+    try {
+        const events = await Event.find({})
+            .select("title coverImages eventDate location createdAt")
+            .sort({ createdAt: -1 })
+            .lean();
+        res.status(200).json(events);
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// Single event — full detail including organizers + apply link
+app.get("/api/events/:id", auth, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const event = await Event.findById(req.params.id)
+            .populate("createdBy", "username photoURL")
+            .lean();
+
+        if (!event) return res.status(404).json({ message: "Event not found" });
+        res.status(200).json(event);
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// Create — organizer only
+app.post("/api/events", auth, requireOrganizer, async (req, res) => {
+    try {
+        const { title, description, coverImages, eventDate, location, organizers, applyLink } = req.body;
+
+        if (!title?.trim()) return res.status(400).json({ message: "Title is required" });
+        if (!eventDate)      return res.status(400).json({ message: "Event date is required" });
+
+        const event = await Event.create({
+            title:       title.trim(),
+            description: description?.trim() || "",
+            coverImages: Array.isArray(coverImages) ? coverImages.slice(0, 6) : [],
+            eventDate:   new Date(eventDate),
+            location:    location?.trim() || "",
+            organizers:  Array.isArray(organizers) ? organizers.filter(o => o.name?.trim()) : [],
+            applyLink:   applyLink?.trim() || "",
+            createdBy:   req.user,
+        });
+
+        res.status(201).json({ message: "Event created", event });
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
+});
+
+// Update — organizer only (any organizer can edit any event — shared team model)
+app.put("/api/events/:id", auth, requireOrganizer, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const { title, description, coverImages, eventDate, location, organizers, applyLink } = req.body;
+        const updates = {};
+        if (title !== undefined)       updates.title       = title.trim();
+        if (description !== undefined) updates.description = description.trim();
+        if (coverImages !== undefined) updates.coverImages = Array.isArray(coverImages) ? coverImages.slice(0, 6) : [];
+        if (eventDate !== undefined)   updates.eventDate   = new Date(eventDate);
+        if (location !== undefined)    updates.location    = location.trim();
+        if (organizers !== undefined)  updates.organizers  = Array.isArray(organizers) ? organizers.filter(o => o.name?.trim()) : [];
+        if (applyLink !== undefined)   updates.applyLink   = applyLink.trim();
+
+        const event = await Event.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true });
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        res.status(200).json({ message: "Event updated", event });
+    } catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// Delete — organizer only
+app.delete("/api/events/:id", auth, requireOrganizer, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const event = await Event.findByIdAndDelete(req.params.id);
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        res.status(200).json({ message: "Event deleted" });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
@@ -459,31 +472,11 @@ app.delete("/api/messages/:messageId", auth, async (req, res) => {
 
 /* ═══════════════════════════════════════════════
    SOCKET.IO
+   FIX: send_message only emits to the chat ROOM.
+   A separate "message_notification" event goes to
+   the receiver's personal room for badge updates.
+   This prevents the duplicate message bug.
 ═══════════════════════════════════════════════ */
-
-// Cache accepted connection partner IDs per user so socket events
-// don't need a DB query on every connect/disconnect/message.
-// Invalidated when connections change (accept/withdraw/reject).
-const connPartnerCache = new Map(); // userId → [partnerId, ...]
-
-async function getConnPartners(userId) {
-    if (connPartnerCache.has(userId)) return connPartnerCache.get(userId);
-    const conns = await Connection.find(
-        { $or: [{ fromUser: userId }, { toUser: userId }], status: "accepted" },
-        { fromUser: 1, toUser: 1 }
-    ).lean();
-    const partners = conns.map(c =>
-        c.fromUser.toString() === userId ? c.toUser.toString() : c.fromUser.toString()
-    );
-    connPartnerCache.set(userId, partners);
-    return partners;
-}
-
-function invalidateConnCache(userId1, userId2) {
-    connPartnerCache.delete(userId1.toString());
-    if (userId2) connPartnerCache.delete(userId2.toString());
-}
-
 io.on("connection", socket => {
 
     socket.on("user_online", async (userId) => {
@@ -492,42 +485,61 @@ io.on("connection", socket => {
         onlineUsers.set(userId, socket.id);
         socket.join(`user_${userId}`);
 
+        // Tell online friends this user came online
         try {
-            const partners = await getConnPartners(userId);
-            partners.forEach(otherId => {
+            const conns = await Connection.find({
+                $or: [{ fromUser: userId }, { toUser: userId }], status: "accepted",
+            }).lean();
+            conns.forEach(c => {
+                const otherId = c.fromUser.toString() === userId ? c.toUser.toString() : c.fromUser.toString();
                 const otherSocket = onlineUsers.get(otherId);
                 if (otherSocket) io.to(otherSocket).emit("friend_online", { userId });
             });
         } catch (_) {}
     });
 
-    socket.on("join_chat", connectionId => { socket.join(connectionId); });
-    socket.on("leave_chat", connectionId => { socket.leave(connectionId); });
+    socket.on("join_chat", connectionId => {
+        socket.join(connectionId);
+    });
 
+    socket.on("leave_chat", connectionId => {
+        socket.leave(connectionId);
+    });
+
+    // FIX: Only emit new_message to the chat ROOM.
+    // Emit message_notification to receiver's personal room for badge only.
     socket.on("send_message", async ({ connectionId, senderUserId, text }) => {
         try {
             if (!text?.trim()) return;
 
             const msg = await Message.create({
-                connectionId, senderUser: senderUserId, text: text.trim(),
+                connectionId,
+                senderUser: senderUserId,
+                text: text.trim(),
             });
 
             const populated = await Message.findById(msg._id)
-                .populate("senderUser", "username photoURL").lean();
+                .populate("senderUser", "username photoURL")
+                .lean();
 
+            // Send new_message ONLY to the chat room — both users who joined it get it once
             io.to(connectionId).emit("new_message", populated);
 
-            // Badge notification to receiver's personal room
+            // Send a SEPARATE lightweight notification to receiver's personal room
+            // This is just for the badge — it does NOT render a message
             try {
-                const partners = await getConnPartners(senderUserId);
-                // Find which partner belongs to this connection
-                const conn = await Connection.findById(connectionId, { fromUser:1, toUser:1 }).lean();
+                const conn = await Connection.findById(connectionId).lean();
                 if (conn) {
                     const receiverId = conn.fromUser.toString() === senderUserId.toString()
-                        ? conn.toUser.toString() : conn.fromUser.toString();
-                    if (onlineUsers.has(receiverId)) {
+                        ? conn.toUser.toString()
+                        : conn.fromUser.toString();
+
+                    // Only send if receiver is NOT in the chat room
+                    const receiverSocket = onlineUsers.get(receiverId);
+                    if (receiverSocket) {
                         io.to(`user_${receiverId}`).emit("message_notification", {
-                            connectionId, senderUserId,
+                            connectionId,
+                            senderUserId,
                             preview: text.trim().slice(0, 50),
                         });
                     }
@@ -545,11 +557,13 @@ io.on("connection", socket => {
         if (!socket.userId) return;
         onlineUsers.delete(socket.userId);
         try {
-            // Fire-and-forget lastSeen update — don't await so disconnect is fast
-            User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() }).exec();
-
-            const partners = await getConnPartners(socket.userId);
-            partners.forEach(otherId => {
+            await User.findByIdAndUpdate(socket.userId, { lastSeen: new Date() });
+            const conns = await Connection.find({
+                $or: [{ fromUser: socket.userId }, { toUser: socket.userId }], status: "accepted",
+            }).lean();
+            conns.forEach(c => {
+                const otherId = c.fromUser.toString() === socket.userId
+                    ? c.toUser.toString() : c.fromUser.toString();
                 const otherSocket = onlineUsers.get(otherId);
                 if (otherSocket) io.to(otherSocket).emit("friend_offline", {
                     userId: socket.userId, lastSeen: new Date(),
