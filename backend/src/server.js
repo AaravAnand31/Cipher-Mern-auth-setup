@@ -29,6 +29,9 @@ const User = mongoose.model("User", new mongoose.Schema({
     coverURL:    { type: String,   default: "" },
     profileDone: { type: Boolean,  default: false },
     lastSeen:    { type: Date,     default: null  },
+    // "organizer" can create/edit/delete events. Set manually in MongoDB Atlas —
+    // there is intentionally no admin UI for promoting users.
+    role:        { type: String, enum: ["student", "organizer"], default: "student" },
 }, { timestamps: true }));
 
 const connSchema = new mongoose.Schema({
@@ -60,6 +63,35 @@ connSchema.index({ fromUser: 1, status: 1 });  // my sent requests / accepted co
 connSchema.index({ status: 1 });               // filtering by status globally
 
 
+/* ── EVENTS ─────────────────────────────────────────
+   Campus events posted by event-planner leads (role
+   "organizer"). Students get read-only access.
+─────────────────────────────────────────────────── */
+const eventSchema = new mongoose.Schema({
+    title:       { type: String, required: true, trim: true },
+    description: { type: String, default: "" },
+    // Base64 data URLs, resized client-side before upload
+    coverImages: { type: [String], default: [] },
+    eventDate:   { type: Date,   required: true },
+    location:    { type: String, default: "" },
+    organizers: [{
+        name:      { type: String, default: "" },
+        roleTitle: { type: String, default: "" },
+        phone:     { type: String, default: "" },
+        email:     { type: String, default: "" },
+    }],
+    applyLink:   { type: String, default: "" },
+    createdBy:   { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+}, { timestamps: true });
+
+// Newest-posted-first is the default list order, so index createdAt.
+// eventDate is indexed for upcoming/past filtering.
+eventSchema.index({ createdAt: -1 });
+eventSchema.index({ eventDate: 1 });
+
+const Event = mongoose.model("Event", eventSchema);
+
+
 /* ═══════════════════════════════════════════════
    AUTH MIDDLEWARE
 ═══════════════════════════════════════════════ */
@@ -72,6 +104,20 @@ function auth(req, res, next) {
         next();
     } catch (e) {
         res.status(401).json({ message: "Invalid token" });
+    }
+}
+
+/* Gate for event write operations. Always chained AFTER auth,
+   so req.user is already populated with the caller's id. */
+async function requireOrganizer(req, res, next) {
+    try {
+        const user = await User.findById(req.user, { role: 1 }).lean();
+        if (!user) return res.status(401).json({ message: "User not found" });
+        if (user.role !== "organizer")
+            return res.status(403).json({ message: "Only event organizers can do that" });
+        next();
+    } catch (e) {
+        res.status(500).json({ message: "Server error" });
     }
 }
 
@@ -88,7 +134,9 @@ const httpServer = http.createServer(app);
 const io         = new Server(httpServer, { cors: { origin: "*" } });
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));  // 15mb was too permissive — profiles don't need that
+// Profiles are small, but an event post carries several base64 cover photos.
+// Images are resized client-side before upload, so 12mb is generous headroom.
+app.use(express.json({ limit: "12mb" }));
 
 // Compress all responses — reduces data sent over the wire significantly
 // especially for large chat history or user lists
@@ -454,6 +502,131 @@ app.delete("/api/messages/:messageId", auth, async (req, res) => {
         console.log("Delete error:", e);
         res.status(500).json({ message: "Server error: " + e.message });
     }
+});
+
+
+/* ═══════════════════════════════════════════════
+   EVENT ROUTES
+═══════════════════════════════════════════════ */
+
+// Normalise whatever the client sent into a clean organizer list.
+function cleanOrganizers(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .map(o => ({
+            name:      String(o?.name      || "").trim(),
+            roleTitle: String(o?.roleTitle || "").trim(),
+            phone:     String(o?.phone     || "").trim(),
+            email:     String(o?.email     || "").trim(),
+        }))
+        .filter(o => o.name);   // an organizer with no name is not useful
+}
+
+// LIST — newest posted first.
+// Only the first cover image is returned; sending every base64 image for
+// every event would make this response enormous. Detail view has them all.
+app.get("/api/events", auth, async (req, res) => {
+    try {
+        const events = await Event.find({})
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+
+        res.status(200).json(events.map(ev => ({
+            _id:         ev._id,
+            title:       ev.title,
+            description: ev.description,
+            eventDate:   ev.eventDate,
+            location:    ev.location,
+            applyLink:   ev.applyLink,
+            createdAt:   ev.createdAt,
+            coverImage:  ev.coverImages?.[0] || "",
+            imageCount:  ev.coverImages?.length || 0,
+            organizerCount: ev.organizers?.length || 0,
+        })));
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
+});
+
+// DETAIL — full record including every cover image.
+app.get("/api/events/:id", auth, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const ev = await Event.findById(req.params.id)
+            .populate("createdBy", "username photoURL")
+            .lean();
+
+        if (!ev) return res.status(404).json({ message: "Event not found" });
+        res.status(200).json(ev);
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
+});
+
+// CREATE — organizers only.
+app.post("/api/events", auth, requireOrganizer, async (req, res) => {
+    try {
+        const { title, description, coverImages, eventDate, location, organizers, applyLink } = req.body;
+
+        if (!title || !String(title).trim())
+            return res.status(400).json({ message: "Title is required" });
+        if (!eventDate || isNaN(new Date(eventDate).getTime()))
+            return res.status(400).json({ message: "A valid event date is required" });
+
+        const ev = await Event.create({
+            title:       String(title).trim(),
+            description: String(description || "").trim(),
+            coverImages: Array.isArray(coverImages) ? coverImages.slice(0, 8) : [],
+            eventDate:   new Date(eventDate),
+            location:    String(location || "").trim(),
+            organizers:  cleanOrganizers(organizers),
+            applyLink:   String(applyLink || "").trim(),
+            createdBy:   req.user,
+        });
+
+        res.status(201).json({ message: "Event published", event: ev });
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
+});
+
+// UPDATE — organizers only.
+app.put("/api/events/:id", auth, requireOrganizer, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const updates = {};
+        if (req.body.title       !== undefined) updates.title       = String(req.body.title).trim();
+        if (req.body.description !== undefined) updates.description = String(req.body.description).trim();
+        if (req.body.location    !== undefined) updates.location    = String(req.body.location).trim();
+        if (req.body.applyLink   !== undefined) updates.applyLink   = String(req.body.applyLink).trim();
+        if (req.body.coverImages !== undefined)
+            updates.coverImages = Array.isArray(req.body.coverImages) ? req.body.coverImages.slice(0, 8) : [];
+        if (req.body.organizers  !== undefined) updates.organizers  = cleanOrganizers(req.body.organizers);
+        if (req.body.eventDate   !== undefined) {
+            const d = new Date(req.body.eventDate);
+            if (isNaN(d.getTime())) return res.status(400).json({ message: "Invalid event date" });
+            updates.eventDate = d;
+        }
+
+        if (updates.title === "") return res.status(400).json({ message: "Title cannot be empty" });
+
+        const ev = await Event.findByIdAndUpdate(req.params.id, { $set: updates }, { new: true });
+        if (!ev) return res.status(404).json({ message: "Event not found" });
+
+        res.status(200).json({ message: "Event updated", event: ev });
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
+});
+
+// DELETE — organizers only.
+app.delete("/api/events/:id", auth, requireOrganizer, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id))
+            return res.status(400).json({ message: "Invalid event ID" });
+
+        const ev = await Event.findByIdAndDelete(req.params.id);
+        if (!ev) return res.status(404).json({ message: "Event not found" });
+
+        res.status(200).json({ message: "Event deleted" });
+    } catch (e) { console.log(e); res.status(500).json({ message: "Server error" }); }
 });
 
 
