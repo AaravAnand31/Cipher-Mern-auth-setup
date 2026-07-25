@@ -109,8 +109,24 @@ function auth(req, res, next) {
 
 /* Gate for event write operations. Always chained AFTER auth,
    so req.user is already populated with the caller's id. */
+/* ─────────────────────────────────────────────────
+   WHO CAN POST EVENTS
+
+   true  → any logged-in user can post/edit/delete events   (launch)
+   false → only users with role "organizer" can              (later)
+
+   To restrict later: change this to false and redeploy the
+   backend. Nothing else needs to change — the frontend asks
+   the backend whether the current user may post, so the
+   "Post event" button appears/disappears automatically.
+───────────────────────────────────────────────── */
+const OPEN_POSTING = true;
+
 async function requireOrganizer(req, res, next) {
     try {
+        // While posting is open, every authenticated user is allowed.
+        if (OPEN_POSTING) return next();
+
         const user = await User.findById(req.user, { role: 1 }).lean();
         if (!user) return res.status(401).json({ message: "User not found" });
         if (user.role !== "organizer")
@@ -175,7 +191,14 @@ app.post("/api/auth/login", async (req, res) => {
 app.get("/api/auth/me", auth, async (req, res) => {
     try {
         const user = await User.findById(req.user).select("-password");
-        res.status(200).json(user);
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        // Tell the client whether this user may post events, so the UI
+        // never has to know the posting rule itself. When OPEN_POSTING is
+        // on, everyone can; otherwise only organizers can.
+        const canPostEvents = OPEN_POSTING || user.role === "organizer";
+
+        res.status(200).json({ ...user.toObject(), canPostEvents });
     } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
